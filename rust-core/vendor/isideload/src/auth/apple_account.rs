@@ -53,6 +53,9 @@ pub struct AppleAccount {
     /// The pages under gsa.apple.com/auth turned the client away with a bare
     /// 403, so they're asked as a Mac (see `send_auth`).
     auth_as_mac: bool,
+    /// Apple answered `secondaryAuth`: confirm through its web /auth flow, as account.apple.com does.
+    web_2fa: bool,
+    code_accepted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,11 +104,8 @@ impl PhoneCodeMode {
 #[serde(rename_all = "camelCase")]
 pub struct TwoFactorCallbackParams {
     pub last_error: Option<String>,
-    // If this is true, we don't know what's going to work, so present the user with all the options and let them choose
     pub unknown: bool,
-    /// A code went to `selected_number_id` instead of the trusted devices.
     pub sms: bool,
-    /// With `sms`: that code is being read out in a call rather than texted.
     pub voice: bool,
     pub numbers: Vec<TrustedNumber>,
     pub selected_number_id: Option<u32>,
@@ -115,7 +115,6 @@ pub struct TwoFactorCallbackParams {
 pub enum TwoFactorCallbackResponse {
     SubmitCode(String),
     SendSms(u32),
-    /// Have Apple call this trusted number and read the code out.
     CallNumber(u32),
     SendToDevices,
     ResendCode,
@@ -159,21 +158,10 @@ struct SmsSecurityCode {
 }
 
 impl AppleAccount {
-    /// Create a new AppleAccountBuilder with the given email
-    ///
-    /// # Arguments
-    /// - `email`: The Apple ID email address
     pub fn builder(email: &str) -> AppleAccountBuilder {
         AppleAccountBuilder::new(email)
     }
 
-    /// Build the apple account with the given email
-    ///
-    /// Reccomended to use the AppleAccountBuilder instead
-    /// # Arguments
-    /// - `email`: The Apple ID email address
-    /// - `anisette_provider`: The anisette provider to use
-    /// - `debug`: DANGER, If true, accept invalid certificates and enable verbose connection
     pub async fn new(
         email: &str,
         anisette_generator: AnisetteDataGenerator,
@@ -185,10 +173,6 @@ impl AppleAccount {
 
         let client_info = match anisette_generator.get_client_info().await {
             Ok(client_info) => client_info,
-            // The anisette server is asked before Apple. When it can't be
-            // reached at all, Apple is checked too: if the URL bag can't be
-            // fetched either, the device's network is the problem, and that
-            // error says so, as it did when the bag came first.
             Err(e) if is_unreachable(&e) => {
                 let fallback = AnisetteClientInfo {
                     client_info: WINDOWS_CLIENT_INFO.to_string(),
@@ -217,16 +201,11 @@ impl AppleAccount {
             last_error: None,
             phone_mode: PhoneCodeMode::Sms,
             auth_as_mac: false,
+            web_2fa: false,
+            code_accepted: false,
         })
     }
 
-    /// Log in to the Apple ID account
-    /// # Arguments
-    /// - `password`: The Apple ID password
-    /// - `two_factor_callback`: Called whenever Apple is waiting on the user. It answers with
-    ///   a code, a request for a code by another route, or an abort.
-    /// # Errors
-    /// Returns an error if the login fails
     pub async fn login<C, Fut>(
         &mut self,
         password: &str,
@@ -240,6 +219,8 @@ impl AppleAccount {
         if self.debug {
             warn!("Debug mode enabled: this is a security risk!");
         }
+        self.web_2fa = false;
+        self.code_accepted = false;
 
         self.login_state = self
             .login_inner(password)
@@ -252,8 +233,6 @@ impl AppleAccount {
 
         loop {
             attempts += 1;
-            // Every prompt, resend and change of method is a step, so leave room
-            // for someone who mistypes a code and then switches to a text.
             if attempts > 30 {
                 bail!(
                     "Couldn't login after 30 attempts, aborting (current state: {:?})",
@@ -266,6 +245,11 @@ impl AppleAccount {
                     return Ok(());
                 }
                 LoginState::NeedsDevice2FA => {
+                    if self.code_accepted {
+                        bail!(
+                            "Apple accepted the verification code but asked for a new one after signing in again; stopped so it does not keep sending codes"
+                        );
+                    }
                     self.load_trusted_numbers().await;
                     self.send_trusted_device_2fa()
                         .await
@@ -273,15 +257,18 @@ impl AppleAccount {
                     self.login_state = LoginState::NeedsDevice2FAVerification;
                 }
                 LoginState::NeedsDevice2FAVerification => {
-                    // Not loaded yet when Apple sent the code unasked.
                     self.load_trusted_numbers().await;
                     let response = two_factor_callback(self.callback_params(false, None)).await?;
                     self.last_error = None;
                     self.login_state = match response {
-                        TwoFactorCallbackResponse::SubmitCode(code) => self
-                            .verify_trusted_device_2fa(code)
-                            .await
-                            .context("Failed to verify trusted device 2FA")?,
+                        TwoFactorCallbackResponse::SubmitCode(code) => {
+                            if self.web_2fa {
+                                self.verify_web_device_2fa(code).await
+                            } else {
+                                self.verify_trusted_device_2fa(code).await
+                            }
+                            .context("Failed to verify trusted device 2FA")?
+                        }
                         TwoFactorCallbackResponse::SendSms(number) => {
                             self.select_number(number, PhoneCodeMode::Sms)?
                         }
@@ -369,7 +356,6 @@ impl AppleAccount {
         }
     }
 
-    /// Get the user's first and last name associated with the Apple ID
     pub fn get_name(&self) -> Result<(String, String), Report> {
         let spd = self
             .spd
@@ -409,8 +395,6 @@ impl AppleAccount {
         }
     }
 
-    /// Fetch the trusted numbers once per login. Not fatal when it fails: the
-    /// device code works without them, and so does the number Apple implied.
     async fn load_trusted_numbers(&mut self) {
         if self.trusted_phone_numbers.is_some() {
             return;
@@ -425,8 +409,6 @@ impl AppleAccount {
         self.trusted_phone_numbers = Some(numbers);
     }
 
-    /// `secondaryAuth` names no number, so that flow starts from id 1 as upstream
-    /// does; switch to a real trusted number when 1 isn't one.
     fn resolve_number_id(&self, id: u32) -> u32 {
         Self::pick_number_id(self.trusted_phone_numbers.as_deref().unwrap_or_default(), id)
     }
@@ -457,9 +439,6 @@ impl AppleAccount {
             .await
             .context("Failed to request trusted device 2fa")?;
         if Self::refuses_client(status.as_u16(), &text) {
-            // Apple may have pushed a code at the password proof anyway (it
-            // did to the Android and Windows clients), and `validateCode`,
-            // outside /auth, takes it; with none, the user can pick another way.
             warn!("Apple turned the trusted-device code request away (bare 403); asking for a code anyway");
             self.last_error = Some(DEVICE_CODE_UNCONFIRMED.to_string());
             return Ok(());
@@ -511,7 +490,6 @@ impl AppleAccount {
                 if let Some(&SideloadError::AuthWithMessage(code, ref message)) =
                     cause.downcast_current_context::<SideloadError>()
                 {
-                    // Incorrect Verification Code, let the user try again
                     if code == -21669 {
                         warn!("{} - {}", code, message);
                         self.last_error = format!("{} - {}", code, message).into();
@@ -524,7 +502,57 @@ impl AppleAccount {
         res?;
 
         debug!("Trusted device 2FA completed, need to login again");
+        self.code_accepted = true;
 
+        Ok(LoginState::NeedsLogin)
+    }
+
+    async fn verify_web_device_2fa(&mut self, code: String) -> Result<LoginState, Report> {
+        let anisette_data = self
+            .anisette_generator
+            .get_anisette_data(self.grandslam_client.clone())
+            .await
+            .context("Failed to get anisette data for 2FA")?;
+
+        let body = serde_json::json!({
+            "securityCode": {
+                "code": code
+            }
+        });
+
+        let headers = self.build_2fa_headers(&anisette_data).await?;
+        let (status, text) = self
+            .send_auth(
+                reqwest::Method::POST,
+                "https://gsa.apple.com/auth/verify/trusteddevice/securitycode",
+                true,
+                headers,
+                Some(body.to_string()),
+            )
+            .await
+            .context("Failed to submit trusted device 2FA code")?;
+        if !status.is_success() {
+            let error = Self::parse_sms_error(text, status.as_u16())?;
+
+            if error.code == "-21669" {
+                warn!("{} - {}", error.title, error.message);
+                self.last_error = format!("{} - {}", error.title, error.message).into();
+                return Ok(LoginState::NeedsDevice2FAVerification);
+            }
+
+            bail!(
+                "Trusted device 2FA code submission failed (code {}): {} - {}",
+                error.code,
+                error.title,
+                error.message
+            );
+        };
+
+        debug!(
+            "Trusted device 2FA completed through the web flow (status {}), need to login again",
+            status
+        );
+        self.code_accepted = true;
         Ok(LoginState::NeedsLogin)
     }
 
@@ -555,10 +583,6 @@ impl AppleAccount {
             .await
             .context("Failed to request phone 2FA code")?;
 
-        // A bare 403 here even as a Mac: Apple asked for a code by text and
-        // then refused to send one, as it did through the macOS-ADI servers on
-        // 2026-10-16. The trusted devices are tried instead, as SideStore lets
-        // the user pick them whatever Apple asked for.
         if Self::refuses_client(status.as_u16(), &text) {
             warn!("Apple turned the phone-code request away (bare 403); sending the code to the trusted devices instead");
             self.last_error = Some(PHONE_CODE_REFUSED.to_string());
@@ -576,14 +600,8 @@ impl AppleAccount {
                 warn!("{} - {} ({})", error.title, error.message, error.code);
                 self.last_error = format!("{} - {}", error.title, error.message).into();
                 if matches!(error.code.as_str(), "-22979" | "-22981") {
-                    // Apple refused to send a new code, but the last one sent is
-                    // still valid: keep the selected number and let the user
-                    // enter it without triggering another send.
                     return Ok(LoginState::NeedsSMS2FAVerification(id));
                 }
-                // -28248 means this method isn't available. Upstream fails the
-                // sign-in on any other refusal; offering the other routes instead
-                // matters here because a call may be refused where a text isn't.
                 return Ok(LoginState::NeedsUnknown2FA);
             }
         }
@@ -623,7 +641,6 @@ impl AppleAccount {
             let error = Self::parse_sms_error(text, status.as_u16())?;
 
             if error.code == "-21669" {
-                // Incorrect Verification Code, let the user try again
                 warn!("{} - {}", error.title, error.message);
                 self.last_error = format!("{} - {}", error.title, error.message).into();
                 return Ok(LoginState::NeedsSMS2FAVerification(id));
@@ -638,6 +655,7 @@ impl AppleAccount {
         };
 
         debug!("Phone 2FA completed, need to login again");
+        self.code_accepted = true;
         Ok(LoginState::NeedsLogin)
     }
 
@@ -736,6 +754,12 @@ impl AppleAccount {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(numbers) = json.get("trustedPhoneNumbers")
         {
+            debug!(
+                "2FA state: mode {:?}, trustedDeviceCount {:?}, noTrustedDevices {:?}",
+                json.get("mode"),
+                json.get("trustedDeviceCount"),
+                json.get("noTrustedDevices")
+            );
             let numbers: Vec<TrustedNumber> = serde_json::from_value(numbers.clone())
                 .context("Failed to parse trusted phone numbers")?;
             debug!(
@@ -772,11 +796,6 @@ impl AppleAccount {
         bail!("Selected trusted number ID not found in trusted numbers");
     }
 
-    /// Sends a request to a page under gsa.apple.com/auth and returns its
-    /// status and body. It says the client is the one the rest of sign-in
-    /// reports; if a page turns that away with a bare 403 (no `serviceErrors`),
-    /// as these pages did the Android phone, it's sent again as a Mac, and so
-    /// are the session's later ones (see `GrandSlam`'s `MAC_CLIENT_INFO`).
     async fn send_auth(
         &mut self,
         method: reqwest::Method,
@@ -811,8 +830,6 @@ impl AppleAccount {
         }
     }
 
-    /// A 403 without Apple's `serviceErrors`: the page refusing the client
-    /// itself rather than answering the request.
     fn refuses_client(status: u16, text: &str) -> bool {
         status == 403 && Self::parse_sms_service_error(text).is_none()
     }
@@ -868,14 +885,14 @@ impl AppleAccount {
                     "Version": "1.0.1"
                 },
                 "Request": {
-                    "A2k": a_pub.clone(), // A2k = client public ephemeral
-                    "cpd": cpd.clone(), // cpd = client provided data
-                    "o": "init", // o = operation
-                    "ps": [ // ps = protocols supported
+                    "A2k": a_pub.clone(),
+                    "cpd": cpd.clone(),
+                    "o": "init",
+                    "ps": [
                         "s2k",
                         "s2k_fo"
                     ],
-                    "u": email.clone(), // u = username
+                    "u": email.clone(),
                 }
             })
         };
@@ -888,12 +905,6 @@ impl AppleAccount {
             .await
             .context("Failed to send initial login request")?;
 
-        // Anisette servers on Apple's Windows ADI library (ani.jkcoxson.com,
-        // win.ani.sidestore.io) get this at the first sign-in of a machine
-        // (the macOS-ADI ones haven't, 2026-10-16):
-        // hsc 434, -22421 "This action could not be completed. Try again.", with
-        // resync data for the ADI library. Once the server has applied it, the
-        // same request goes through, and later sign-ins need no resync.
         if let Some(sim) = Self::resync_sim(&response) {
             info!("GrandSlam asked for an anisette resync (hsc 434); retrying");
             cpd = self
@@ -961,11 +972,11 @@ impl AppleAccount {
                 "Version": "1.0.1"
             },
             "Request": {
-                "M1": verifier.proof().to_vec(), // A2k = client public ephemeral
-                "c": c, // c = client proof from step 1
-                "cpd": cpd, // cpd = client provided data
-                "o": "complete", // o = operation
-                "u": self.email.clone(), // u = username
+                "M1": verifier.proof().to_vec(),
+                "c": c,
+                "cpd": cpd,
+                "o": "complete",
+                "u": self.email.clone(),
             }
         });
 
@@ -1010,11 +1021,16 @@ impl AppleAccount {
 
         debug!("Login step 2 completed");
 
+        if matches!(
+            status.get("au"),
+            Some(plist::Value::String(s)) if s == "secondaryAuth"
+        ) {
+            self.web_2fa = true;
+        }
+
         Ok(Self::state_after_proof(status))
     }
 
-    /// The resync data (base64) in a GrandSlam `Response` whose `Status` asks
-    /// for an anisette resync with hsc 434, or `None`.
     fn resync_sim(response: &Dictionary) -> Option<String> {
         let status = response.get("Status")?.as_dictionary()?;
         if status.get("hsc").and_then(|v| v.as_signed_integer()) != Some(434) {
@@ -1027,24 +1043,16 @@ impl AppleAccount {
         }
     }
 
-    /// What the `Status` of an accepted password proof asks for next.
     fn state_after_proof(status: &Dictionary) -> LoginState {
         if let Some(plist::Value::String(s)) = status.get("au") {
             return match s.as_str() {
                 "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
-                // Names no number: start from 1 as upstream does; the
-                // state swaps in a real trusted number if 1 isn't one.
-                "secondaryAuth" => LoginState::NeedsSMS2FA(1),
-                "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
+                "secondaryAuth" => LoginState::NeedsDevice2FA,
+                "repair" => LoginState::LoggedIn,
                 unknown => LoginState::NeedsExtraStep(unknown.to_string()),
             };
         }
 
-        // The Android phone this crate reported from 2026-10-13 to 2026-10-15
-        // got no `au`. With hsc 409 a second step is still due, and Apple has
-        // already pushed a code to the trusted devices: asking for another
-        // isn't needed, `validateCode` takes that one. Taken for a finished
-        // sign-in, the app token request after it fails with -22411.
         if status.get("hsc").and_then(|v| v.as_signed_integer()) == Some(409) {
             info!("Apple has sent a 2FA code to the trusted devices");
             return LoginState::NeedsDevice2FAVerification;
@@ -1225,8 +1233,6 @@ impl AppleAccount {
 
 #[cfg(test)]
 mod sms_send_response_tests {
-    // Upstream's contract tests from f560857 (dropped from its branch in c7e1bc4),
-    // with the request mode added, plus the call and number-fallback cases.
     use super::{AppleAccount, PhoneCodeMode, SmsSendOutcome, TrustedNumber};
     use serde_json::{Value, json};
 
@@ -1431,7 +1437,7 @@ mod state_after_proof_tests {
         ));
         assert!(matches!(
             AppleAccount::state_after_proof(&status(409, Some("secondaryAuth"))),
-            LoginState::NeedsSMS2FA(1)
+            LoginState::NeedsDevice2FA
         ));
         assert!(matches!(
             AppleAccount::state_after_proof(&status(409, Some("repair"))),
@@ -1441,7 +1447,6 @@ mod state_after_proof_tests {
 
     #[test]
     fn a_pending_step_apple_names_none_for_waits_for_the_code_it_sent() {
-        // What gsa.apple.com answered an Android client on 2026-10-13.
         assert!(matches!(
             AppleAccount::state_after_proof(&status(409, None)),
             LoginState::NeedsDevice2FAVerification
@@ -1456,7 +1461,6 @@ mod state_after_proof_tests {
 
     #[test]
     fn a_resync_request_yields_its_sim_as_base64() {
-        // ani.jkcoxson.com's first init on 2026-10-15 got a string.
         let mut asked = status(434, None);
         asked.insert("ec".into(), (-22421).into());
         asked.insert("X-Apple-I-MD-DATA".into(), "c2ltLWRhdGE=".into());
@@ -1537,8 +1541,6 @@ fn censor_email(email: &str) -> String {
     }
 }
 
-/// True if `report` comes from a request that never reached its server: no
-/// connection (DNS included) or no answer in time.
 fn is_unreachable(report: &Report) -> bool {
     report.iter_reports().any(|cause| {
         cause
@@ -1581,10 +1583,8 @@ mod auth_page_tests {
 
     #[test]
     fn only_a_bare_403_refuses_the_client() {
-        // How the pages under /auth turned the Android phone away.
         assert!(AppleAccount::refuses_client(403, ""));
         assert!(AppleAccount::refuses_client(403, "<html>Forbidden</html>"));
-        // A refusal of the request itself is answered, not retried as a Mac.
         let refused = r#"{"serviceErrors":[{"code":"-22981","title":"t","message":"m"}]}"#;
         assert!(!AppleAccount::refuses_client(403, refused));
         assert!(!AppleAccount::refuses_client(401, ""));
