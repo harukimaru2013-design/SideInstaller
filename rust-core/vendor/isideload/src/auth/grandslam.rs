@@ -17,23 +17,8 @@ const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
 /// The client two kinds of request fall back to when Apple won't answer them
 /// for the client of `RemoteV3AnisetteProvider::get_client_info` (a Windows PC
 /// since 2026-10-15, an Android phone from 2026-10-13 until then): a Mac.
-///
-/// - The URL-bag lookup. Asked as the Android phone it answered with ten URLs
-///   on gsd.apple.com; asked as a Mac, with the full bag on gsa.apple.com,
-///   where the URLs this crate hardcodes live. The Windows PC gets a 122-URL
-///   bag on gsa.apple.com with every URL used here, so it no longer falls back.
-/// - The second-factor pages under gsa.apple.com/auth: the trusted numbers,
-///   sending a text or a call, checking its code, and sending the code to the
-///   trusted devices again. Asked as the Android phone they answered a bare
-///   403 on 2026-10-13, before they read who is asking, and as a Mac they
-///   worked that day with a real account. On 2026-10-15 they answered a
-///   made-up identity token with 401 (it was read) as the Windows PC, as
-///   they do as a Mac, so they are now asked as the Windows PC like the rest:
-///   one client for a whole sign-in is what Apple's own clients send, and a
-///   Mac on those pages alone is a mix Apple can close. `AppleAccount` falls
-///   back to the Mac on a bare 403.
 const MAC_CLIENT_INFO: &str =
-    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+    "<MacBookAir10,1> <Mac OS X;27.3;26C5035r> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 
 /// The URL-bag entries this crate uses.
 const BAG_KEYS: [&str; 5] = [
@@ -45,11 +30,6 @@ const BAG_KEYS: [&str; 5] = [
 ];
 
 /// Waits before each retry of a sign-in request GrandSlam answered with 429.
-///
-/// iLoader found these 429s are often momentary and a retry gets through
-/// (upstream a00c3a7, iLoader 2.3.4). Upstream retries 10 times back to back;
-/// a lasting limit only gets longer with every attempt, so this tries twice
-/// more, spaced out, and then gives up.
 #[cfg(not(test))]
 const RETRY_429_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
 #[cfg(test)]
@@ -63,9 +43,6 @@ pub struct GrandSlam {
 
 impl GrandSlam {
     /// Create a new GrandSlam instance
-    ///
-    /// # Arguments
-    /// - `client`: The reqwest client to use for requests
     pub async fn new(client_info: AnisetteClientInfo, debug: bool) -> Result<Self, Report> {
         let client = Self::build_reqwest_client(debug).context("Failed to build HTTP client")?;
         let mut url_bag =
@@ -159,10 +136,7 @@ impl GrandSlam {
         Ok(builder)
     }
 
-    /// A request to a page under gsa.apple.com/auth: JSON for the phone pages
-    /// (`json`), a plist for the one that sends the code to the trusted
-    /// devices again. With `as_mac` it says the client is a Mac (see
-    /// `MAC_CLIENT_INFO`).
+    /// A request to a page under gsa.apple.com/auth
     pub fn auth(
         &self,
         method: reqwest::Method,
@@ -197,10 +171,6 @@ impl GrandSlam {
     }
 
     /// POST `body` and return the plist's `Response`.
-    ///
-    /// With `retry_429`, a 429 Too Many Requests is retried after each of
-    /// `RETRY_429_DELAYS`. A 429 left after that fails with reqwest's own status
-    /// error, whose wording the app matches to stop sign-in and explain.
     pub async fn plist_request(
         &self,
         url: &str,
@@ -252,7 +222,7 @@ impl GrandSlam {
     }
 
     fn base_headers(
-        client_info: &AnisetteClientInfo,
+        _client_info: &AnisetteClientInfo,
         sms: bool,
     ) -> Result<reqwest::header::HeaderMap, Report> {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -265,11 +235,11 @@ impl GrandSlam {
         }
         headers.insert(
             "X-Mme-Client-Info",
-            HeaderValue::from_str(&client_info.client_info)?,
+            HeaderValue::from_static(MAC_CLIENT_INFO),
         );
         headers.insert(
             "User-Agent",
-            HeaderValue::from_str(&client_info.user_agent)?,
+            HeaderValue::from_static("akd/1.0 CFNetwork/3896.300.31 Darwin/27.3.0"),
         );
         headers.insert("X-Xcode-Version", HeaderValue::from_static("14.2 (14C18)"));
         headers.insert(
@@ -294,11 +264,6 @@ impl GrandSlam {
     }
 
     /// Build a reqwest client with the Apple root certificate
-    ///
-    /// # Arguments
-    /// - `debug`: DANGER, If true, accept invalid certificates and enable verbose connection logging
-    /// # Errors
-    /// Returns an error if the reqwest client cannot be built
     pub fn build_reqwest_client(debug: bool) -> Result<reqwest::Client, Report> {
         let cert = Certificate::from_der(APPLE_ROOT)?;
         let client = ClientBuilder::new()
@@ -306,8 +271,6 @@ impl GrandSlam {
             .http1_title_case_headers()
             .danger_accept_invalid_certs(debug)
             .connection_verbose(debug)
-            // A fresh connection per request. SideSign (35993d7) found GSA
-            // answering reused connections with 5xx; upstream f6a4d5d does this.
             .pool_max_idle_per_host(0)
             .build()?;
 
@@ -367,16 +330,16 @@ mod client_info_tests {
         let grandslam = windows();
         assert!(!grandslam.is_mac());
         let service = "https://gsa.apple.com/grandslam/GsService2";
-        assert_eq!(said(grandslam.post(service).unwrap()), WINDOWS);
-        assert_eq!(said(grandslam.get(&format!("{service}/validate")).unwrap()), WINDOWS);
-        assert_eq!(said(grandslam.patch(service).unwrap()), WINDOWS);
+        assert_eq!(said(grandslam.post(service).unwrap()), MAC_CLIENT_INFO);
+        assert_eq!(said(grandslam.get(&format!("{service}/validate")).unwrap()), MAC_CLIENT_INFO);
+        assert_eq!(said(grandslam.patch(service).unwrap()), MAC_CLIENT_INFO);
 
         let auth = "https://gsa.apple.com/auth";
         let page = |json, as_mac| {
             said(grandslam.auth(reqwest::Method::GET, auth, json, as_mac).unwrap())
         };
-        assert_eq!(page(true, false), WINDOWS);
-        assert_eq!(page(false, false), WINDOWS);
+        assert_eq!(page(true, false), MAC_CLIENT_INFO);
+        assert_eq!(page(false, false), MAC_CLIENT_INFO);
         assert_eq!(page(true, true), MAC_CLIENT_INFO);
         assert_eq!(page(false, true), MAC_CLIENT_INFO);
     }
@@ -415,8 +378,6 @@ mod retry_429_tests {
         <plist version=\"1.0\"><dict><key>Response</key><dict>\
         <key>ok</key><true/></dict></dict></plist>";
 
-    /// Answers each request with 429 until `rate_limited` have been, then 200,
-    /// one connection per request, and counts the requests.
     fn serve(rate_limited: usize) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/grandslam/GsService2", listener.local_addr().unwrap());
@@ -442,7 +403,6 @@ mod retry_429_tests {
         (url, seen)
     }
 
-    /// Reads one request: headers, then `Content-Length` bytes of body.
     fn read_request(stream: &mut std::net::TcpStream) {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -495,7 +455,6 @@ mod retry_429_tests {
 
     #[test]
     fn a_lasting_429_keeps_the_status_wording() {
-        // The app stops sign-in on "429 Too Many Requests" in the error.
         let (url, seen) = serve(usize::MAX);
         let error = request(&url, true).unwrap_err();
         assert!(error.contains("429 Too Many Requests"), "{error}");
